@@ -697,3 +697,292 @@ def test_isotonic_regression_output_predict():
 
     assert isinstance(X_trans, pd.DataFrame)
     assert isinstance(y_pred, np.ndarray)
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_isotonic_infinite_X(dtype):
+    X = np.array([0.0, 1.0, np.inf], dtype=dtype)
+    y = np.array([0.0, 0.5, 1.0], dtype=dtype)
+    ir = IsotonicRegression().fit(X, y)
+
+    assert ir.X_max_ == np.inf
+    assert ir.X_thresholds_.dtype == dtype
+    assert_array_equal(ir.X_thresholds_, X)
+    assert_array_equal(ir.y_thresholds_, y)
+    assert_array_equal(ir.fit_transform(X, y), y)
+
+    # Finite inputs above the largest finite threshold are predicted with the
+    # value at that threshold, while +inf maps to the fitted value at +inf.
+    T = np.array([-1.0, 0.0, 0.5, 1.0, 2.0, np.inf], dtype=dtype)
+    expected = np.array([np.nan, 0.0, 0.25, 0.5, 0.5, 1.0], dtype=dtype)
+    y_pred = ir.predict(T)
+    assert y_pred.dtype == dtype
+    assert_allclose(y_pred, expected, equal_nan=True)
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_isotonic_negative_infinite_X(dtype):
+    X = np.array([-np.inf, 0.0, 1.0], dtype=dtype)
+    y = np.array([-1.0, 0.0, 1.0], dtype=dtype)
+    ir = IsotonicRegression().fit(X, y)
+
+    assert ir.X_min_ == -np.inf
+    T = np.array([-np.inf, -1.0, 0.0, 0.5, 1.0], dtype=dtype)
+    expected = np.array([-1.0, 0.0, 0.0, 0.5, 1.0], dtype=dtype)
+    assert_allclose(ir.predict(T), expected)
+
+
+def test_isotonic_infinite_X_both_bounds():
+    X = np.array([-np.inf, 0.0, np.inf])
+    y = np.array([-1.0, 0.0, 1.0])
+    ir = IsotonicRegression().fit(X, y)
+
+    T = np.array([-np.inf, -1.0, 0.0, 1.0, np.inf])
+    expected = np.array([-1.0, 0.0, 0.0, 0.0, 1.0])
+    assert_allclose(ir.predict(T), expected)
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+@pytest.mark.parametrize(
+    "X, y, out_of_bounds, T, expected",
+    [
+        # No finite threshold: only the infinite thresholds are in the domain.
+        (
+            [-np.inf, np.inf],
+            [-1.0, 1.0],
+            "nan",
+            [-np.inf, -1.0, 0.0, 1.0, np.inf],
+            [-1.0, np.nan, np.nan, np.nan, 1.0],
+        ),
+        # Clipping to [-inf, +inf] leaves finite queries finite, hence NaN.
+        (
+            [-np.inf, np.inf],
+            [-1.0, 1.0],
+            "clip",
+            [-np.inf, -1.0, 0.0, 1.0, np.inf],
+            [-1.0, np.nan, np.nan, np.nan, 1.0],
+        ),
+        # A single +inf threshold: finite queries and -inf are out of domain.
+        (
+            [np.inf, np.inf],
+            [0.0, 1.0],
+            "nan",
+            [-np.inf, -1.0, 0.0, 1.0, np.inf],
+            [np.nan, np.nan, np.nan, np.nan, 0.5],
+        ),
+        # ... while clip maps every query onto that threshold.
+        (
+            [np.inf, np.inf],
+            [0.0, 1.0],
+            "clip",
+            [-np.inf, -1.0, 0.0, 1.0, np.inf],
+            [0.5, 0.5, 0.5, 0.5, 0.5],
+        ),
+        # Symmetric case for a single -inf threshold.
+        (
+            [-np.inf, -np.inf],
+            [0.0, 1.0],
+            "nan",
+            [-np.inf, -1.0, 0.0, 1.0, np.inf],
+            [0.5, np.nan, np.nan, np.nan, np.nan],
+        ),
+        (
+            [-np.inf, -np.inf],
+            [0.0, 1.0],
+            "clip",
+            [-np.inf, -1.0, 0.0, 1.0, np.inf],
+            [0.5, 0.5, 0.5, 0.5, 0.5],
+        ),
+    ],
+)
+def test_isotonic_infinite_X_no_finite_threshold(
+    dtype, X, y, out_of_bounds, T, expected
+):
+    ir = IsotonicRegression(out_of_bounds=out_of_bounds).fit(
+        np.array(X, dtype=dtype), np.array(y, dtype=dtype)
+    )
+
+    T = np.array(T, dtype=dtype)
+    y_pred = ir.predict(T)
+    assert y_pred.dtype == dtype
+    assert_allclose(y_pred, expected, equal_nan=True)
+    assert_allclose(ir.transform(T), expected, equal_nan=True)
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+@pytest.mark.parametrize(
+    "X, y, valid, invalid",
+    [
+        ([-np.inf, np.inf], [-1.0, 1.0], [-np.inf, np.inf], [-1.0, 0.0, 1.0]),
+        ([np.inf, np.inf], [0.0, 1.0], [np.inf], [-np.inf, -1.0, 0.0, 1.0]),
+        ([-np.inf, -np.inf], [0.0, 1.0], [-np.inf], [-1.0, 0.0, 1.0, np.inf]),
+    ],
+)
+def test_isotonic_infinite_X_no_finite_threshold_raise(dtype, X, y, valid, invalid):
+    ir = IsotonicRegression(out_of_bounds="raise").fit(
+        np.array(X, dtype=dtype), np.array(y, dtype=dtype)
+    )
+
+    # Only the infinite thresholds themselves are inside the fitted domain.
+    assert_allclose(ir.predict(np.array(valid, dtype=dtype)), ir.y_thresholds_)
+    with pytest.raises(ValueError, match="outside of the interpolation range"):
+        ir.predict(np.array(invalid, dtype=dtype))
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+@pytest.mark.parametrize(
+    "out_of_bounds, T, expected",
+    [
+        ("nan", [-1.0, 2.0, np.inf], [np.nan, 0.5, 1.0]),
+        ("clip", [-1.0, 2.0, np.inf], [0.0, 0.5, 1.0]),
+        ("raise", [2.0, np.inf], [0.5, 1.0]),
+    ],
+)
+def test_isotonic_infinite_X_out_of_bounds(dtype, out_of_bounds, T, expected):
+    ir = IsotonicRegression(out_of_bounds=out_of_bounds).fit(
+        np.array([0.0, 1.0, np.inf], dtype=dtype),
+        np.array([0.0, 0.5, 1.0], dtype=dtype),
+    )
+    y_pred = ir.predict(np.array(T, dtype=dtype))
+    assert y_pred.dtype == dtype
+    assert_allclose(y_pred, expected, equal_nan=True)
+
+    if out_of_bounds == "raise":
+        with pytest.raises(
+            ValueError, match="in x_new is below the interpolation range"
+        ):
+            ir.predict(np.array([-1.0], dtype=dtype))
+
+
+def test_isotonic_nan_in_X_raises():
+    with pytest.raises(ValueError, match="Input X contains NaN."):
+        IsotonicRegression().fit([0.0, 1.0, np.nan], [0.0, 0.5, 1.0])
+    # NaN is rejected even when the same input also contains infinity.
+    with pytest.raises(ValueError, match="Input X contains NaN."):
+        IsotonicRegression().fit([0.0, np.inf, np.nan], [0.0, 0.5, 1.0])
+    # ... including when no finite threshold is present.
+    with pytest.raises(ValueError, match="Input X contains NaN."):
+        IsotonicRegression().fit([-np.inf, np.nan], [0.0, 1.0])
+
+    ir = IsotonicRegression().fit([0.0, 1.0, 2.0], [0.0, 0.5, 1.0])
+    with pytest.raises(ValueError, match="Input contains NaN."):
+        ir.predict([0.0, np.nan])
+    with pytest.raises(ValueError, match="Input contains NaN."):
+        ir.transform([0.0, np.nan])
+
+
+def test_isotonic_infinite_X_duplicate_thresholds():
+    X = [0.0, 1.0, np.inf, np.inf]
+    y = [0.0, 0.5, 0.8, 1.0]
+    ir = IsotonicRegression().fit(X, y)
+
+    assert_array_equal(ir.X_thresholds_, [0.0, 1.0, np.inf])
+    # equal-weight average of the two targets at +inf
+    assert_allclose(ir.y_thresholds_, [0.0, 0.5, 0.9])
+
+    assert_allclose(ir.predict([np.inf]), [0.9])
+    # finite input above the largest finite threshold uses that threshold
+    assert_allclose(ir.predict([1e30]), [0.5])
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+@pytest.mark.parametrize(
+    "out_of_bounds, expected",
+    [("nan", [np.nan, np.nan]), ("clip", [0.0, 1.0])],
+)
+def test_isotonic_infinite_query_finite_thresholds(out_of_bounds, expected, dtype):
+    # A model fitted with only finite thresholds treats infinite query points
+    # as out of bounds.
+    ir = IsotonicRegression(out_of_bounds=out_of_bounds).fit(
+        np.array([0.0, 1.0, 2.0], dtype=dtype),
+        np.array([0.0, 0.5, 1.0], dtype=dtype),
+    )
+    T = np.array([-np.inf, np.inf], dtype=dtype)
+
+    y_pred = ir.predict(T)
+    assert y_pred.dtype == dtype
+    assert_allclose(y_pred, expected, equal_nan=True)
+    assert_allclose(ir.transform(T), expected, equal_nan=True)
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+def test_isotonic_infinite_query_finite_thresholds_raise(dtype):
+    ir = IsotonicRegression(out_of_bounds="raise").fit(
+        np.array([0.0, 1.0, 2.0], dtype=dtype),
+        np.array([0.0, 0.5, 1.0], dtype=dtype),
+    )
+    with pytest.raises(ValueError, match="in x_new is below the interpolation range"):
+        ir.predict(np.array([-np.inf], dtype=dtype))
+    with pytest.raises(ValueError, match="in x_new is above the interpolation range"):
+        ir.transform(np.array([np.inf], dtype=dtype))
+
+
+@pytest.mark.parametrize(
+    "y, expected_increasing",
+    [([0.0, 0.5, 1.0], True), ([1.0, 0.5, 0.0], False)],
+)
+def test_isotonic_infinite_X_increasing_auto(y, expected_increasing):
+    ir = IsotonicRegression(increasing="auto").fit([0.0, 1.0, np.inf], y)
+    assert bool(ir.increasing_) is expected_increasing
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+@pytest.mark.parametrize("out_of_bounds", ["nan", "clip", "raise"])
+@pytest.mark.parametrize(
+    "X, y",
+    [
+        ([0.0, 1.0, np.inf], [0.0, 0.5, 1.0]),
+        ([-np.inf, np.inf], [-1.0, 1.0]),
+        ([np.inf, np.inf], [0.0, 1.0]),
+        ([-np.inf, -np.inf], [0.0, 1.0]),
+    ],
+)
+def test_isotonic_infinite_X_pickle(dtype, out_of_bounds, X, y):
+    ir = IsotonicRegression(out_of_bounds=out_of_bounds).fit(
+        np.array(X, dtype=dtype), np.array(y, dtype=dtype)
+    )
+    ir2 = pickle.loads(pickle.dumps(ir))
+
+    assert ir2.X_thresholds_.dtype == dtype
+
+    if out_of_bounds == "raise":
+        # Query only the thresholds, which are always inside the domain.
+        T = ir.X_thresholds_
+    else:
+        T = np.array([-np.inf, -1.0, 0.0, 1.0, np.inf], dtype=dtype)
+
+    y_pred = ir.predict(T)
+    assert y_pred.dtype == dtype
+    assert_array_equal(y_pred, ir2.predict(T))
+    assert_array_equal(ir.transform(T), ir2.transform(T))
+
+    if out_of_bounds == "raise":
+        with pytest.raises(ValueError, match="interpolation range"):
+            ir2.predict(np.array([-1.0], dtype=dtype))
+
+
+@pytest.mark.parametrize("bad_value", [np.nan, np.inf])
+def test_isotonic_non_finite_y_raises(bad_value):
+    expected = "NaN" if np.isnan(bad_value) else "infinity"
+    with pytest.raises(ValueError, match=f"Input y contains {expected}"):
+        IsotonicRegression().fit([0.0, 1.0, np.inf], [0.0, 0.5, bad_value])
+
+
+def test_isotonic_non_finite_sample_weight_raises():
+    with pytest.raises(ValueError, match="Input sample_weight contains infinity"):
+        IsotonicRegression().fit(
+            [0.0, 1.0, np.inf],
+            [0.0, 0.5, 1.0],
+            sample_weight=[1.0, 1.0, np.inf],
+        )
+
+
+def test_isotonic_regression_infinite_y_raises():
+    with pytest.raises(ValueError, match="Input y contains infinity"):
+        isotonic_regression([0.0, np.inf])
+
+
+def test_isotonic_infinite_X_2d():
+    X = np.array([[0.0], [1.0], [np.inf]])
+    ir = IsotonicRegression().fit(X, [0.0, 0.5, 1.0])
+    assert_allclose(ir.predict([[np.inf]]), [1.0])

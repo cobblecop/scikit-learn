@@ -21,6 +21,18 @@ from sklearn.utils.validation import _check_sample_weight, check_is_fitted
 __all__ = ["IsotonicRegression", "check_increasing", "isotonic_regression"]
 
 
+def _check_no_nan(X, input_name=""):
+    """Raise a ValueError if X contains NaN, while allowing infinite values.
+
+    The stock helper cannot be reused: ``ensure_all_finite="allow-nan"`` allows
+    NaN and rejects infinity, the opposite of what is needed. Rejecting NaN
+    locally also keeps it unconditional under ``assume_finite=True``.
+    """
+    if np.isnan(X).any():
+        padded_input_name = input_name + " " if input_name else ""
+        raise ValueError(f"Input {padded_input_name}contains NaN.")
+
+
 @validate_params(
     {
         "x": ["array-like"],
@@ -239,6 +251,33 @@ class IsotonicRegression(RegressorMixin, TransformerMixin, BaseEstimator):
 
     Notes
     -----
+    ``X`` may contain infinite values while ``y`` and ``sample_weight`` must be
+    finite. Infinite thresholds define an unbounded training domain: for
+    instance, if the largest threshold is ``+inf``, finite inputs between the
+    largest finite threshold and ``+inf`` are predicted with the fitted value at
+    that finite threshold, while an input exactly equal to ``+inf`` is predicted
+    with the fitted value at ``+inf``. The resulting function is therefore
+    discontinuous at ``+inf``. Symmetrically, if the smallest threshold is
+    ``-inf``, finite inputs below the smallest finite threshold are predicted
+    with the fitted value at that finite threshold, while an input exactly equal
+    to ``-inf`` is predicted with the fitted value at ``-inf``. Since ``X_max_``
+    (respectively ``X_min_``) is then infinite, such large finite inputs are no
+    longer considered out of bounds by ``out_of_bounds``. Infinite query points
+    are accepted: on a model fitted with only finite thresholds, they fall
+    outside the fitted domain and yield NaN under the default
+    ``out_of_bounds="nan"``.
+
+    If ``X`` contains no finite threshold (for example ``[-inf, +inf]``), the
+    fitted domain consists only of the infinite thresholds. Predicting exactly
+    ``-inf`` or ``+inf`` returns the corresponding fitted value, while finite
+    query points are out of domain and yield NaN under the default
+    ``out_of_bounds="nan"``. ``out_of_bounds="raise"`` raises for any finite
+    query, and ``out_of_bounds="clip"`` still yields NaN because the bounds
+    themselves are infinite, so clipping cannot move a finite query onto a
+    threshold. Only when the infinite bounds coincide (a single infinite
+    threshold) does ``out_of_bounds="clip"`` map every query onto that
+    threshold.
+
     Ties are broken using the secondary method from de Leeuw, 1977.
 
     References
@@ -292,13 +331,39 @@ class IsotonicRegression(RegressorMixin, TransformerMixin, BaseEstimator):
             raise ValueError(msg)
 
     def _build_f(self, X, y):
-        """Build the f_ interp1d function."""
+        """Build the `f_` prediction function."""
 
         bounds_error = self.out_of_bounds == "raise"
-        if len(y) == 1:
+        if X.size and np.isinf(X).all():
+            # No finite threshold: the fitted domain contains only the infinite
+            # thresholds themselves. Finite queries are therefore out of domain
+            # and yield NaN, unless `out_of_bounds` clips them onto a threshold.
+            X = X.astype(np.float64, copy=False)
+            y = y.astype(np.float64, copy=False)
+
+            def f(x):
+                res = np.full(x.shape, np.nan)
+                for threshold, value in zip(X, y):
+                    res[x == threshold] = value
+                if bounds_error and np.isnan(res).any():
+                    bad = x[np.isnan(res)][0]
+                    raise ValueError(
+                        f"A value ({bad}) in x_new is outside of the "
+                        "interpolation range."
+                    )
+                return res
+
+            self.f_ = f
+        elif len(y) == 1:
             # single y, constant prediction
             self.f_ = lambda x: y.repeat(x.shape)
         else:
+            if np.isinf(X).any():
+                # interp1d only handles infinite abscissae correctly on its
+                # float64/np.interp code path; the generic path used for
+                # float32 returns NaN in intervals with an infinite endpoint.
+                X = X.astype(np.float64, copy=False)
+                y = y.astype(np.float64, copy=False)
             self.f_ = interpolate.interp1d(
                 X, y, kind="linear", bounds_error=bounds_error
             )
@@ -359,14 +424,15 @@ class IsotonicRegression(RegressorMixin, TransformerMixin, BaseEstimator):
         Parameters
         ----------
         X : array-like of shape (n_samples,) or (n_samples, 1)
-            Training data.
+            Training data. Infinite values are supported, but NaN values are
+            rejected.
 
         y : array-like of shape (n_samples,)
-            Training target.
+            Training target. Must be finite.
 
         sample_weight : array-like of shape (n_samples,), default=None
             Weights. If set to None, all weights will be set to 1 (equal
-            weights).
+            weights). Must be finite.
 
         Returns
         -------
@@ -379,9 +445,16 @@ class IsotonicRegression(RegressorMixin, TransformerMixin, BaseEstimator):
         new input data.
         """
         check_params = dict(accept_sparse=False, ensure_2d=False)
+        # Infinite values are meaningful thresholds for isotonic regression,
+        # so only reject NaN in X.
         X = check_array(
-            X, input_name="X", dtype=[np.float64, np.float32], **check_params
+            X,
+            input_name="X",
+            dtype=[np.float64, np.float32],
+            ensure_all_finite=False,
+            **check_params,
         )
+        _check_no_nan(X, input_name="X")
         y = check_array(y, input_name="y", dtype=X.dtype, **check_params)
         check_consistent_length(X, y, sample_weight)
 
@@ -414,7 +487,8 @@ class IsotonicRegression(RegressorMixin, TransformerMixin, BaseEstimator):
         else:
             dtype = np.float64
 
-        T = check_array(T, dtype=dtype, ensure_2d=False)
+        T = check_array(T, dtype=dtype, ensure_2d=False, ensure_all_finite=False)
+        _check_no_nan(T)
 
         self._check_input_data_shape(T)
         T = T.reshape(-1)  # use 1d view
@@ -435,7 +509,8 @@ class IsotonicRegression(RegressorMixin, TransformerMixin, BaseEstimator):
         Parameters
         ----------
         T : array-like of shape (n_samples,) or (n_samples, 1)
-            Data to transform.
+            Data to transform. Infinite values are supported, but NaN values
+            are rejected.
 
         Returns
         -------
@@ -450,7 +525,8 @@ class IsotonicRegression(RegressorMixin, TransformerMixin, BaseEstimator):
         Parameters
         ----------
         T : array-like of shape (n_samples,) or (n_samples, 1)
-            Data to transform.
+            Data to transform. Infinite values are supported, but NaN values
+            are rejected.
 
         Returns
         -------
